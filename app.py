@@ -1,4 +1,3 @@
-
 import streamlit as st
 import sqlite3
 import os
@@ -28,7 +27,7 @@ st.set_page_config(
 
 
 # ============================================================
-# LOAD CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -56,72 +55,180 @@ if not SCHEMA_PATH.exists():
 
 
 # ============================================================
-# INITIALIZE GEMINI AND QDRANT
+# GEMINI AND QDRANT
 # ============================================================
 
 @st.cache_resource
-def initialize_services(api_key):
-
-    client = genai.Client(
-        api_key=api_key,
+def initialize_services(key):
+    gemini_client = genai.Client(
+        api_key=key,
         http_options=types.HttpOptions(timeout=120000)
     )
 
-    qdrant = QdrantClient(":memory:")
+    vector_db = QdrantClient(":memory:")
 
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as file:
-        schema_text = file.read()
+    schema = SCHEMA_PATH.read_text(encoding="utf-8")
 
-    qdrant.create_collection(
+    vector_db.create_collection(
         collection_name="student_schema",
-        vectors_config=VectorParams(
-            size=768,
-            distance=Distance.COSINE
-        )
+        vectors_config=VectorParams(size=768, distance=Distance.COSINE)
     )
 
-    embedding_response = client.models.embed_content(
+    embedding_response = gemini_client.models.embed_content(
         model="gemini-embedding-001",
-        contents=schema_text,
+        contents=schema,
         config=types.EmbedContentConfig(
             task_type="RETRIEVAL_DOCUMENT",
             output_dimensionality=768
         )
     )
 
-    embedding = embedding_response.embeddings[0].values
-
-    qdrant.upsert(
+    vector_db.upsert(
         collection_name="student_schema",
         points=[
             PointStruct(
                 id=1,
-                vector=embedding,
-                payload={
-                    "text": schema_text,
-                    "source": "schema.md"
-                }
+                vector=embedding_response.embeddings[0].values,
+                payload={"text": schema, "source": "schema.md"}
             )
         ]
     )
-
-    return client, qdrant
+    return gemini_client, vector_db
 
 
 try:
     client, qdrant = initialize_services(api_key)
-
-except Exception as e:
-    st.error(f"AI initialization failed: {e}")
+except Exception as error:
+    st.error(f"AI initialization failed: {error}")
     st.stop()
 
 
 # ============================================================
-# DATABASE CONNECTION
+# DATABASE HELPERS
 # ============================================================
 
 def get_database_connection():
-    return sqlite3.connect(str(DATABASE_PATH))
+    connection = sqlite3.connect(str(DATABASE_PATH))
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def get_course_rows():
+    connection = get_database_connection()
+    try:
+        return connection.execute(
+            "SELECT course_id, course_name FROM Courses ORDER BY course_name"
+        ).fetchall()
+    finally:
+        connection.close()
+
+
+def get_schema_context(question):
+    embedding = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=question,
+        config=types.EmbedContentConfig(
+            task_type="RETRIEVAL_QUERY",
+            output_dimensionality=768
+        )
+    )
+    result = qdrant.query_points(
+        collection_name="student_schema",
+        query=embedding.embeddings[0].values,
+        limit=1,
+        with_payload=True
+    )
+    if not result.points:
+        raise ValueError("No database schema found.")
+    return result.points[0].payload["text"]
+
+
+def generate_sql(question):
+    schema = get_schema_context(question)
+    prompt = f"""
+You are an expert SQLite SQL query generator.
+Database schema:
+{schema}
+
+User question:
+{question}
+
+Rules:
+1. Generate exactly one valid SQLite SELECT query.
+2. Use only tables and columns in the schema.
+3. Use JOINs when the question needs related table information.
+4. Never generate INSERT, UPDATE, DELETE, DROP, ALTER, CREATE or other write queries.
+5. Return SQL only, without markdown or explanation.
+"""
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0)
+    )
+    if not response.text:
+        raise ValueError("Gemini returned an empty SQL response.")
+
+    sql_query = re.sub(
+        r"^```(?:sql)?\s*|\s*```$",
+        "",
+        response.text.strip(),
+        flags=re.IGNORECASE
+    ).strip()
+
+    if not re.match(r"^SELECT\b", sql_query, re.IGNORECASE):
+        raise ValueError("Only SELECT queries are allowed.")
+    return sql_query
+
+
+def execute_read_only_query(sql_query):
+    connection = get_database_connection()
+    allowed_actions = {
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_FUNCTION,
+        sqlite3.SQLITE_RECURSIVE
+    }
+
+    def read_only_authorizer(action, arg1, arg2, database_name, trigger):
+        if action in allowed_actions:
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    try:
+        connection.set_authorizer(read_only_authorizer)
+        cursor = connection.execute(sql_query)
+        rows = cursor.fetchall()
+        columns = [description[0] for description in cursor.description]
+        return pd.DataFrame(rows, columns=columns)
+    finally:
+        connection.close()
+
+
+def display_query_result(question):
+    with st.spinner("AI is understanding your question and generating SQL..."):
+        sql_query = generate_sql(question)
+
+    st.subheader("📝 Generated SQL Query")
+    st.code(sql_query, language="sql")
+
+    with st.spinner("Executing query safely..."):
+        result_df = execute_read_only_query(sql_query)
+
+    st.subheader("📊 Query Result")
+    if result_df.empty:
+        st.info("No records found.")
+    else:
+        st.success("Query executed successfully!")
+        st.dataframe(result_df, width="stretch", hide_index=True)
+
+
+def extract_json_from_response(response):
+    if not response.text:
+        raise ValueError("Gemini returned an empty response.")
+    data = json.loads(response.text)
+    if not isinstance(data, dict):
+        raise ValueError("AI returned an invalid data structure.")
+    return data
 
 
 # ============================================================
@@ -129,441 +236,307 @@ def get_database_connection():
 # ============================================================
 
 st.title("🤖 AI-Powered Database Assistant")
-
 st.write(
-    "Ask questions about student records in simple English. "
-    "AI will generate SQL and retrieve answers from your database."
+    "Ask questions about student and fee records in English or Hinglish. "
+    "AI generates safe SQL queries and retrieves answers from SQLite."
 )
-
 st.divider()
+
+
+# ============================================================
+# DATABASE STRUCTURE CHECK
+# ============================================================
+
+try:
+    connection = get_database_connection()
+    table_names = {
+        row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    connection.close()
+
+    required_tables = {"Students", "Courses", "Fees"}
+    if not required_tables.issubset(table_names):
+        st.error(
+            "Database migration is not complete. Please run "
+            "`python migrate_database.py` after confirming your backup."
+        )
+        st.stop()
+except sqlite3.Error as error:
+    st.error(f"Database error: {error}")
+    st.stop()
 
 
 # ============================================================
 # DASHBOARD STATISTICS
 # ============================================================
 
-conn = get_database_connection()
-cursor = conn.cursor()
-
-total = cursor.execute(
+connection = get_database_connection()
+total_students = connection.execute(
     "SELECT COUNT(*) FROM Students"
 ).fetchone()[0]
-
-active = cursor.execute(
+active_students = connection.execute(
     "SELECT COUNT(*) FROM Students WHERE status='Active'"
 ).fetchone()[0]
-
-inactive = cursor.execute(
+inactive_students = connection.execute(
     "SELECT COUNT(*) FROM Students WHERE status='Inactive'"
 ).fetchone()[0]
-
-mca = cursor.execute(
-    "SELECT COUNT(*) FROM Students WHERE course='MCA'"
+mca_students = connection.execute(
+    """
+    SELECT COUNT(*)
+    FROM Students s
+    JOIN Courses c ON s.course_id = c.course_id
+    WHERE LOWER(c.course_name) = 'mca'
+    """
 ).fetchone()[0]
+total_fee_collection = connection.execute(
+    "SELECT COALESCE(SUM(amount), 0) FROM Fees"
+).fetchone()[0]
+connection.close()
 
-conn.close()
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Total Students", total)
-col2.metric("Active Students", active)
-col3.metric("Inactive Students", inactive)
-col4.metric("MCA Students", mca)
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("Total Students", total_students)
+col2.metric("Active Students", active_students)
+col3.metric("Inactive Students", inactive_students)
+col4.metric("MCA Students", mca_students)
+col5.metric("Fee Collection", f"₹{total_fee_collection:,.0f}")
 
 
 # ============================================================
-# READ OPERATION - VIEW AND SEARCH STUDENT RECORDS
+# STUDENT RECORDS - READ, SEARCH AND FILTER
 # ============================================================
 
 st.divider()
 st.header("👩‍🎓 Student Records")
+st.write("View, search and filter student records stored in the database.")
 
-st.write(
-    "View, search and filter student records stored in the database."
-)
-
-read_conn = get_database_connection()
-
-try:
-
-    course_options = pd.read_sql_query(
+connection = get_database_connection()
+course_rows = connection.execute(
+    "SELECT course_id, course_name FROM Courses ORDER BY course_name"
+).fetchall()
+status_options = [
+    row[0] for row in connection.execute(
         """
-        SELECT DISTINCT course
-        FROM Students
-        WHERE course IS NOT NULL AND TRIM(course) != ''
-        ORDER BY course
-        """,
-        read_conn
-    )["course"].tolist()
-
-    status_options = pd.read_sql_query(
-        """
-        SELECT DISTINCT status
-        FROM Students
+        SELECT DISTINCT status FROM Students
         WHERE status IS NOT NULL AND TRIM(status) != ''
         ORDER BY status
-        """,
-        read_conn
-    )["status"].tolist()
+        """
+    ).fetchall()
+]
+connection.close()
 
-finally:
-    read_conn.close()
-
+course_name_by_id = {row[0]: row[1] for row in course_rows}
+course_id_by_name = {row[1]: row[0] for row in course_rows}
+course_names = list(course_id_by_name.keys())
 
 search_col, course_col, status_col = st.columns(3)
-
 with search_col:
     search_text = st.text_input(
         "🔍 Search Student",
         placeholder="Enter name or email...",
         key="read_search"
     )
-
 with course_col:
     selected_course = st.selectbox(
         "Filter by Course",
-        options=["All Courses"] + course_options,
+        ["All Courses"] + course_names,
         key="read_course_filter"
     )
-
 with status_col:
     selected_status = st.selectbox(
         "Filter by Status",
-        options=["All Statuses"] + status_options,
+        ["All Statuses"] + status_options,
         key="read_status_filter"
     )
 
-
-sql = """
-    SELECT
-        student_id,
-        name,
-        email,
-        course,
-        status,
-        joining_date,
-        city
-    FROM Students
-    WHERE 1=1
+student_sql = """
+SELECT s.student_id, s.name, s.email, c.course_name AS course,
+       s.status, s.joining_date, s.city
+FROM Students s
+JOIN Courses c ON s.course_id = c.course_id
+WHERE 1=1
 """
-
-params = []
+student_params = []
 
 if search_text.strip():
-    sql += " AND (name LIKE ? OR email LIKE ?)"
+    student_sql += " AND (s.name LIKE ? OR s.email LIKE ?)"
     search_value = f"%{search_text.strip()}%"
-    params.extend([search_value, search_value])
+    student_params.extend([search_value, search_value])
 
 if selected_course != "All Courses":
-    sql += " AND course = ?"
-    params.append(selected_course)
+    student_sql += " AND c.course_name = ?"
+    student_params.append(selected_course)
 
 if selected_status != "All Statuses":
-    sql += " AND status = ?"
-    params.append(selected_status)
+    student_sql += " AND s.status = ?"
+    student_params.append(selected_status)
 
-sql += " ORDER BY student_id DESC"
+student_sql += " ORDER BY s.student_id DESC"
 
-read_conn = get_database_connection()
-
-try:
-    students_df = pd.read_sql_query(
-        sql,
-        read_conn,
-        params=params
-    )
-finally:
-    read_conn.close()
-
+connection = get_database_connection()
+students_df = pd.read_sql_query(student_sql, connection, params=student_params)
+connection.close()
 
 st.metric("Matching Student Records", len(students_df))
-
 if not students_df.empty:
-    st.dataframe(
-        students_df,
-        width="stretch",
-        hide_index=True
-    )
+    st.dataframe(students_df, width="stretch", hide_index=True)
 else:
     st.info("No student records found. Try changing your search or filters.")
 
 
 # ============================================================
-# UPDATE OPERATION - EDIT EXISTING STUDENT RECORDS
+# UPDATE STUDENT
 # ============================================================
 
 st.divider()
 st.header("✏️ Update Student Details")
 
-st.write(
-    "Select an existing student and update their information."
+connection = get_database_connection()
+update_students = pd.read_sql_query(
+    "SELECT student_id, name FROM Students ORDER BY student_id",
+    connection
 )
-
-update_conn = get_database_connection()
-
-try:
-    update_students = pd.read_sql_query(
-        """
-        SELECT student_id, name, email
-        FROM Students
-        ORDER BY student_id
-        """,
-        update_conn
-    )
-finally:
-    update_conn.close()
-
-
-# Function to display student name with ID
-def format_student_option(student_id):
-
-    student_name = update_students.loc[
-        update_students["student_id"] == student_id,
-        "name"
-    ].iloc[0]
-
-    return f"ID: {student_id} - {student_name}"
-
+connection.close()
 
 if update_students.empty:
-
     st.info("No student records available to update.")
-
 else:
-
-    student_ids = update_students["student_id"].tolist()
+    def format_student_option(student_id):
+        row = update_students.loc[
+            update_students["student_id"] == student_id
+        ].iloc[0]
+        return f"ID: {student_id} - {row['name']}"
 
     selected_student_id = st.selectbox(
         "Select Student to Update",
-        options=student_ids,
+        update_students["student_id"].tolist(),
         format_func=format_student_option,
         key="update_student_selection"
     )
 
-    update_conn = get_database_connection()
-
-    try:
-        selected_student = update_conn.execute(
-            """
-            SELECT
-                student_id,
-                name,
-                email,
-                course,
-                status,
-                joining_date,
-                city
-            FROM Students
-            WHERE student_id = ?
-            """,
-            (selected_student_id,)
-        ).fetchone()
-
-    finally:
-        update_conn.close()
+    connection = get_database_connection()
+    selected_student = connection.execute(
+        """
+        SELECT s.student_id, s.name, s.email, s.course_id,
+               s.status, s.joining_date, s.city
+        FROM Students s WHERE s.student_id = ?
+        """,
+        (selected_student_id,)
+    ).fetchone()
+    connection.close()
 
     if selected_student:
-
         (
-            student_id,
-            old_name,
-            old_email,
-            old_course,
-            old_status,
-            old_joining_date,
-            old_city
+            student_id, old_name, old_email, old_course_id,
+            old_status, old_joining_date, old_city
         ) = selected_student
 
-        st.info(f"Editing Student ID: {student_id}")
+        current_course_index = 0
+        course_ids = [row[0] for row in course_rows]
+        if old_course_id in course_ids:
+            current_course_index = course_ids.index(old_course_id)
 
         status_values = ["Active", "Inactive"]
-
-        current_status = (
-            old_status
-            if old_status in status_values
-            else "Active"
-        )
+        current_status = old_status if old_status in status_values else "Active"
 
         with st.form(key=f"update_student_form_{student_id}"):
-
-            edit_name = st.text_input(
-                "Student Name",
-                value=old_name or ""
-            )
-
-            edit_email = st.text_input(
-                "Email Address",
-                value=old_email or ""
-            )
-
-            edit_course = st.text_input(
+            edit_name = st.text_input("Student Name", value=old_name or "")
+            edit_email = st.text_input("Email Address", value=old_email or "")
+            edit_course_name = st.selectbox(
                 "Course",
-                value=old_course or ""
+                options=course_names,
+                index=current_course_index
             )
-
             edit_status = st.selectbox(
                 "Student Status",
-                options=status_values,
+                status_values,
                 index=status_values.index(current_status)
             )
-
             edit_joining_date = st.text_input(
                 "Joining Date (YYYY-MM-DD)",
                 value=old_joining_date or "",
                 placeholder="2026-07-15"
             )
-
-            edit_city = st.text_input(
-                "City",
-                value=old_city or ""
-            )
-
+            edit_city = st.text_input("City", value=old_city or "")
             update_button = st.form_submit_button(
-                "💾 Update Student",
-                type="primary"
+                "💾 Update Student", type="primary"
             )
 
         if update_button:
-
             if not edit_name.strip():
                 st.error("Student name is required.")
-
-            elif not edit_email.strip():
-                st.error("Email address is required.")
-
-            elif not re.match(
-                r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
-                edit_email.strip()
-            ):
+            elif not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", edit_email.strip()):
                 st.error("Please enter a valid email address.")
-
             else:
-
                 try:
-
                     if edit_joining_date.strip():
                         date.fromisoformat(edit_joining_date.strip())
 
-                    update_conn = get_database_connection()
-
-                    try:
-
-                        update_conn.execute(
-                            """
-                            UPDATE Students
-                            SET
-                                name = ?,
-                                email = ?,
-                                course = ?,
-                                status = ?,
-                                joining_date = ?,
-                                city = ?
-                            WHERE student_id = ?
-                            """,
-                            (
-                                edit_name.strip(),
-                                edit_email.strip(),
-                                edit_course.strip(),
-                                edit_status,
-                                edit_joining_date.strip() or None,
-                                edit_city.strip(),
-                                student_id
-                            )
+                    connection = get_database_connection()
+                    connection.execute(
+                        """
+                        UPDATE Students
+                        SET name=?, email=?, course_id=?, status=?,
+                            joining_date=?, city=?
+                        WHERE student_id=?
+                        """,
+                        (
+                            edit_name.strip(), edit_email.strip(),
+                            course_id_by_name[edit_course_name], edit_status,
+                            edit_joining_date.strip() or None,
+                            edit_city.strip(), student_id
                         )
-
-                        update_conn.commit()
-
-                    finally:
-                        update_conn.close()
-
-                    st.session_state.update_message = (
-                        f"Student {edit_name.strip()} updated successfully!"
                     )
-
+                    connection.commit()
+                    connection.close()
+                    st.success(f"Student {edit_name.strip()} updated successfully!")
                     st.rerun()
-
                 except ValueError:
-                    st.error(
-                        "Invalid joining date. Use YYYY-MM-DD format."
-                    )
-
+                    st.error("Invalid joining date. Use YYYY-MM-DD format.")
                 except sqlite3.IntegrityError:
-                    st.error(
-                        "This email already belongs to another student."
-                    )
-
-                except sqlite3.Error as e:
-                    st.error(f"Database error: {e}")
-
-                except Exception as e:
-                    st.error(f"Something went wrong: {e}")
-
-
-if st.session_state.get("update_message"):
-
-    st.success(st.session_state.update_message)
-    del st.session_state.update_message
+                    st.error("This email already belongs to another student.")
+                except sqlite3.Error as error:
+                    st.error(f"Database error: {error}")
 
 
 # ============================================================
-# DELETE OPERATION - DELETE STUDENT RECORD
+# DELETE STUDENT
 # ============================================================
 
 st.divider()
 st.header("🗑️ Delete Student Record")
 
-st.write(
-    "Select a student record that you want to delete."
+connection = get_database_connection()
+delete_students = pd.read_sql_query(
+    "SELECT student_id, name FROM Students ORDER BY student_id",
+    connection
 )
-
-delete_conn = get_database_connection()
-
-try:
-    delete_students = pd.read_sql_query(
-        """
-        SELECT student_id, name, email
-        FROM Students
-        ORDER BY student_id
-        """,
-        delete_conn
-    )
-finally:
-    delete_conn.close()
-
+connection.close()
 
 if delete_students.empty:
-
     st.info("No student records available to delete.")
-
 else:
-
-    delete_student_ids = delete_students["student_id"].tolist()
-
     def format_delete_student_option(student_id):
-
-        student_name = delete_students.loc[
-            delete_students["student_id"] == student_id,
-            "name"
+        row = delete_students.loc[
+            delete_students["student_id"] == student_id
         ].iloc[0]
-
-        return f"ID: {student_id} - {student_name}"
+        return f"ID: {student_id} - {row['name']}"
 
     selected_delete_id = st.selectbox(
         "Select Student to Delete",
-        options=delete_student_ids,
+        delete_students["student_id"].tolist(),
         format_func=format_delete_student_option,
         key="delete_student_selection"
     )
-
     selected_delete_student = delete_students[
         delete_students["student_id"] == selected_delete_id
     ].iloc[0]
 
     st.warning(
-        f"You have selected: {selected_delete_student['name']} "
-        f"(ID: {selected_delete_id})"
+        f"Selected: {selected_delete_student['name']} "
+        f"(ID: {selected_delete_id}). Related fee records will also be deleted."
     )
-
     confirm_delete = st.checkbox(
         "I confirm that I want to permanently delete this student.",
         key="confirm_delete_student"
@@ -575,576 +548,519 @@ else:
         disabled=not confirm_delete,
         key="delete_student_button"
     ):
-
-        delete_conn = get_database_connection()
-
+        connection = get_database_connection()
         try:
-
-            delete_conn.execute(
-                "DELETE FROM Students WHERE student_id = ?",
+            connection.execute(
+                "DELETE FROM Students WHERE student_id=?",
                 (selected_delete_id,)
             )
-
-            delete_conn.commit()
-
-            st.session_state.delete_message = (
-                f"Student {selected_delete_student['name']} "
-                "deleted successfully!"
-            )
-
+            connection.commit()
+            st.success("Student and linked fee records deleted successfully.")
             st.rerun()
-
-        except sqlite3.Error as e:
-
-            st.error(f"Database error: {e}")
-
+        except sqlite3.Error as error:
+            st.error(f"Database error: {error}")
         finally:
-            delete_conn.close()
+            connection.close()
 
-
-if st.session_state.get("delete_message"):
-
-    st.success(st.session_state.delete_message)
-    del st.session_state.delete_message
 
 # ============================================================
-# COURSE-WISE ANALYSIS
+# COURSE, CITY AND STATUS ANALYSIS
 # ============================================================
 
 st.divider()
 st.subheader("📚 Course-wise Student Distribution")
 
-chart_conn = get_database_connection()
-
-try:
-    course_data = pd.read_sql_query(
-        """
-        SELECT course, COUNT(*) AS total_students
-        FROM Students
-        GROUP BY course
-        ORDER BY total_students DESC
-        """,
-        chart_conn
-    )
-finally:
-    chart_conn.close()
-
-st.bar_chart(
-    course_data,
-    x="course",
-    y="total_students",
-    x_label="Course",
-    y_label="Number of Students"
+connection = get_database_connection()
+course_data = pd.read_sql_query(
+    """
+    SELECT c.course_name AS course, COUNT(s.student_id) AS total_students
+    FROM Courses c
+    LEFT JOIN Students s ON s.course_id = c.course_id
+    GROUP BY c.course_id, c.course_name
+    ORDER BY total_students DESC
+    """,
+    connection
 )
+city_data = pd.read_sql_query(
+    """
+    SELECT city, COUNT(*) AS total_students
+    FROM Students GROUP BY city ORDER BY total_students DESC
+    """,
+    connection
+)
+status_data = pd.read_sql_query(
+    """
+    SELECT status, COUNT(*) AS total_students
+    FROM Students GROUP BY status
+    """,
+    connection
+)
+connection.close()
 
-
-# ============================================================
-# CITY-WISE ANALYSIS
-# ============================================================
+if not course_data.empty:
+    st.bar_chart(
+        course_data, x="course", y="total_students",
+        x_label="Course", y_label="Number of Students"
+    )
 
 st.subheader("🌍 City-wise Student Distribution")
-
-city_conn = get_database_connection()
-
-try:
-    city_data = pd.read_sql_query(
-        """
-        SELECT city, COUNT(*) AS total_students
-        FROM Students
-        GROUP BY city
-        ORDER BY total_students DESC
-        """,
-        city_conn
+if not city_data.empty:
+    st.bar_chart(
+        city_data, x="city", y="total_students",
+        x_label="City", y_label="Number of Students"
     )
-finally:
-    city_conn.close()
-
-st.bar_chart(
-    city_data,
-    x="city",
-    y="total_students",
-    x_label="City",
-    y_label="Number of Students"
-)
-
-
-# ============================================================
-# STUDENT STATUS ANALYSIS
-# ============================================================
 
 st.subheader("📊 Active vs Inactive Students")
-
-status_conn = get_database_connection()
-
-try:
-    status_data = pd.read_sql_query(
-        """
-        SELECT status, COUNT(*) AS total_students
-        FROM Students
-        GROUP BY status
-        """,
-        status_conn
+if not status_data.empty:
+    status_fig = px.pie(
+        status_data, names="status", values="total_students",
+        title="Student Status Distribution", hole=0.4
     )
-finally:
-    status_conn.close()
+    st.plotly_chart(status_fig, width="stretch")
 
-fig = px.pie(
-    status_data,
-    names="status",
-    values="total_students",
-    title="Student Status Distribution",
-    hole=0.4
-)
 
-st.plotly_chart(fig, width="stretch")
+# ============================================================
+# FEES RECORDS
+# ============================================================
 
 st.divider()
+st.header("💰 Fee Records")
+
+connection = get_database_connection()
+fees_df = pd.read_sql_query(
+    """
+    SELECT f.fee_id, s.student_id, s.name AS student_name,
+           f.receipt_number, f.amount, f.payment_date, f.payment_mode
+    FROM Fees f
+    JOIN Students s ON s.student_id = f.student_id
+    ORDER BY f.fee_id DESC
+    """,
+    connection
+)
+connection.close()
+
+if fees_df.empty:
+    st.info("No fee receipts have been added yet.")
+else:
+    st.dataframe(fees_df, width="stretch", hide_index=True)
 
 
 # ============================================================
-# AI DATABASE QUESTION INPUT
+# ASK YOUR DATABASE - ENGLISH AND HINGLISH
 # ============================================================
 
-st.subheader("💬 Ask Your Database")
+st.divider()
+st.header("💬 Ask Your Database")
+st.caption(
+    "Examples: How many students are in MCA? | MCA ke kitne students hain? "
+    "| Rahul ki fees kitni hai?"
+)
 
 question = st.text_input(
     "Enter your question:",
-    placeholder="Example: How many students are enrolled in MCA?"
+    placeholder="MCA ke kitne students hain?",
+    key="typed_database_question"
 )
 
-
-# ============================================================
-# PROCESS DATABASE QUESTION
-# ============================================================
-
-if st.button("Generate Answer", type="primary"):
-
+if st.button("Generate Answer", type="primary", key="typed_query_button"):
     if not question.strip():
-
         st.warning("Please enter your question first.")
-
     else:
-
         try:
-
-            with st.spinner("Understanding your question..."):
-
-                embedding_response = client.models.embed_content(
-                    model="gemini-embedding-001",
-                    contents=question,
-                    config=types.EmbedContentConfig(
-                        task_type="RETRIEVAL_QUERY",
-                        output_dimensionality=768
-                    )
-                )
-
-                query_vector = embedding_response.embeddings[0].values
-
-                search_result = qdrant.query_points(
-                    collection_name="student_schema",
-                    query=query_vector,
-                    limit=1,
-                    with_payload=True
-                )
-
-                if not search_result.points:
-                    st.error("No database schema found in Qdrant.")
-                    st.stop()
-
-                schema = search_result.points[0].payload["text"]
-
-                prompt = f"""
-You are an expert SQLite SQL query generator.
-
-Database Schema:
-{schema}
-
-User Question:
-{question}
-
-Instructions:
-1. Generate only one valid SQLite SELECT query.
-2. Use only existing tables and columns.
-3. Never generate INSERT, UPDATE, DELETE, DROP,
-   ALTER, CREATE or other modification queries.
-4. Return only SQL without explanation or markdown.
-
-SQL Query:
-"""
-
-                response = client.models.generate_content(
-                    model="gemini-3.6-flash",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0
-                    )
-                )
-
-                if not response.text:
-                    raise ValueError("Gemini returned an empty SQL response.")
-
-                sql_query = response.text.strip()
-
-                sql_query = re.sub(
-                    r"^```(?:sql)?\s*|\s*```$",
-                    "",
-                    sql_query,
-                    flags=re.IGNORECASE
-                ).strip()
-
-            st.subheader("📝 Generated SQL Query")
-            st.code(sql_query, language="sql")
-
-            st.subheader("📊 Query Result")
-
-            if not re.match(r"^SELECT\b", sql_query, re.IGNORECASE):
-                st.error("Only SELECT queries are allowed.")
-                st.stop()
-
-            database = get_database_connection()
-
-            allowed_actions = {
-                sqlite3.SQLITE_SELECT,
-                sqlite3.SQLITE_READ,
-                sqlite3.SQLITE_FUNCTION,
-                sqlite3.SQLITE_RECURSIVE
-            }
-
-            def read_only_authorizer(
-                action,
-                arg1,
-                arg2,
-                database_name,
-                trigger
-            ):
-                if action in allowed_actions:
-                    return sqlite3.SQLITE_OK
-                return sqlite3.SQLITE_DENY
-
-            try:
-                database.set_authorizer(read_only_authorizer)
-
-                result_cursor = database.execute(sql_query)
-                result = result_cursor.fetchall()
-
-                columns = [
-                    description[0]
-                    for description in result_cursor.description
-                ]
-
-            finally:
-                database.close()
-
-            if result:
-
-                st.success("Query executed successfully!")
-
-                result_df = pd.DataFrame(
-                    result,
-                    columns=columns
-                )
-
-                st.dataframe(result_df, width="stretch")
-
-            else:
-                st.info("No records found.")
-
-        except Exception as e:
-            st.error(f"Something went wrong: {e}")
+            display_query_result(question.strip())
+        except Exception as error:
+            st.error(f"Unable to process the question: {error}")
 
 
 # ============================================================
-# AI IMAGE TO STUDENT FORM
+# VOICE-TO-TEXT DATABASE QUERY
+# ============================================================
+
+st.divider()
+st.header("🎙️ Ask Your Database by Voice")
+st.write(
+    "Record your question in English or Hinglish. Gemini will understand "
+    "the speech, generate a read-only SQL query and show the database result."
+)
+
+audio_value = st.audio_input("Record your database question")
+
+if audio_value is not None:
+    st.audio(audio_value)
+    if st.button("🤖 Process Voice Question", type="primary"):
+        try:
+            with st.spinner("AI is listening to your question..."):
+                audio_part = types.Part.from_bytes(
+                    data=audio_value.getvalue(),
+                    mime_type="audio/wav"
+                )
+                voice_prompt = """
+Listen to the attached audio. It contains a user asking a question about
+a student and fee database, possibly in English or Hinglish.
+Return valid JSON only with this structure:
+{
+  "transcription": "exact words spoken",
+  "question_in_english": "same question expressed clearly in English"
+}
+Do not invent information. If speech is unclear, say so in the transcription.
+"""
+                voice_response = client.models.generate_content(
+                    model="gemini-3.6-flash",
+                    contents=[voice_prompt, audio_part],
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                        response_mime_type="application/json"
+                    )
+                )
+                voice_data = extract_json_from_response(voice_response)
+
+            transcript = str(voice_data.get("transcription", "")).strip()
+            interpreted_question = str(
+                voice_data.get("question_in_english", "")
+            ).strip()
+
+            st.subheader("🗣️ Voice Transcription")
+            st.write(transcript or "No clear speech detected.")
+
+            if interpreted_question:
+                st.subheader("🔎 Understood Question")
+                st.write(interpreted_question)
+                display_query_result(interpreted_question)
+            else:
+                st.warning("Could not understand the voice question. Please record again.")
+        except Exception as error:
+            st.error(f"Voice processing failed: {error}")
+
+
+# ============================================================
+# AI STUDENT REGISTRATION - IMAGE EXTRACTION
 # ============================================================
 
 st.divider()
 st.title("📝 AI Student Registration")
-
 st.write(
-    "Upload a student form image. AI will extract "
-    "the details and automatically fill the registration form."
+    "Upload a student form image. AI extracts the details, and you can "
+    "review them before saving the student."
 )
 
-
-# ============================================================
-# SUCCESS MESSAGE AFTER SAVING
-# ============================================================
-
 if st.session_state.get("student_save_message"):
-
     st.success(st.session_state.student_save_message)
-    st.balloons()
-
     del st.session_state.student_save_message
 
-
-# ============================================================
-# IMAGE UPLOAD
-# ============================================================
-
-st.subheader("Step 1: Upload Student Image")
-
+st.subheader("Step 1: Upload Student Form Image")
 uploaded_image = st.file_uploader(
     "Upload Student Form Image",
     type=["png", "jpg", "jpeg"],
     key="student_image"
 )
 
-
-# ============================================================
-# IMAGE PREVIEW
-# ============================================================
-
 if uploaded_image is not None:
-
-    st.image(
-        uploaded_image,
-        caption="Uploaded Student Form",
-        width=350
-    )
-
-
-# ============================================================
-# EXTRACT STUDENT DATA USING GEMINI VISION
-# ============================================================
+    st.image(uploaded_image, caption="Uploaded Student Form", width=350)
 
 if st.button("🤖 Extract Student Details", type="primary"):
-
     if uploaded_image is None:
-
         st.warning("Please upload a student image first.")
-
     else:
-
         try:
-
             with st.spinner("AI is reading student information..."):
-
                 image_part = types.Part.from_bytes(
                     data=uploaded_image.getvalue(),
                     mime_type=uploaded_image.type
                 )
-
                 extraction_prompt = """
-You are an AI assistant that extracts student
-information from uploaded student forms or registers.
-
-Extract the following fields:
-
+Extract only visible student information from this form.
+Return valid JSON only:
 {
-    "name": "",
-    "email": "",
-    "course": "",
-    "status": "",
-    "joining_date": "",
-    "city": ""
+  "name": "",
+  "email": "",
+  "course": "",
+  "status": "",
+  "joining_date": "",
+  "city": ""
 }
-
-Instructions:
-1. Carefully read the uploaded student image.
-2. Extract only information visible in the image.
-3. Never invent missing information.
-4. If a field is missing or unclear, return an empty string.
-5. Convert dates into YYYY-MM-DD format if possible.
-6. Status must be Active or Inactive only.
-7. Return valid JSON only.
+Rules:
+- Never invent missing values.
+- Use empty string if a value is missing or unclear.
+- Format dates as YYYY-MM-DD where possible.
+- Status must be Active or Inactive, otherwise empty.
 """
-
                 response = client.models.generate_content(
                     model="gemini-3.6-flash",
-                    contents=[
-                        extraction_prompt,
-                        image_part
-                    ],
+                    contents=[extraction_prompt, image_part],
                     config=types.GenerateContentConfig(
                         temperature=0,
                         response_mime_type="application/json"
                     )
                 )
+                extracted = extract_json_from_response(response)
 
-                if not response.text:
-                    raise ValueError("Gemini returned an empty response.")
+            for field in ["name", "email", "course", "status", "joining_date", "city"]:
+                extracted[field] = str(extracted.get(field) or "").strip()
 
-                extracted_data = json.loads(response.text)
+            if extracted["status"].lower() == "active":
+                extracted["status"] = "Active"
+            elif extracted["status"].lower() == "inactive":
+                extracted["status"] = "Inactive"
+            else:
+                extracted["status"] = "Select Status"
 
-                if not isinstance(extracted_data, dict):
-                    raise ValueError("AI returned an invalid data structure.")
+            st.session_state.student_form_data = extracted
+            st.session_state.student_extraction_done = True
 
-                required_fields = [
-                    "name",
-                    "email",
-                    "course",
-                    "status",
-                    "joining_date",
-                    "city"
-                ]
+            st.session_state.student_name = extracted["name"]
+            st.session_state.student_email = extracted["email"]
+            st.session_state.student_status = extracted["status"]
+            st.session_state.student_joining_date = extracted["joining_date"]
+            st.session_state.student_city = extracted["city"]
 
-                for field in required_fields:
-
-                    if extracted_data.get(field) is None:
-                        extracted_data[field] = ""
-
-                    extracted_data[field] = str(
-                        extracted_data.get(field, "")
-                    ).strip()
-
-                extracted_status = extracted_data["status"].lower()
-
-                if extracted_status == "active":
-                    extracted_data["status"] = "Active"
-
-                elif extracted_status == "inactive":
-                    extracted_data["status"] = "Inactive"
-
-                else:
-                    extracted_data["status"] = "Select Status"
-
-                st.session_state.student_form_data = extracted_data
-                st.session_state.student_extraction_done = True
-
-                for field in required_fields:
-                    st.session_state["student_" + field] = extracted_data[field]
-
+            matching_course = next(
+                (
+                    name for name in course_names
+                    if name.strip().casefold() == extracted["course"].strip().casefold()
+                ),
+                None
+            )
+            st.session_state.student_course = (
+                matching_course if matching_course else "-- Select a course --"
+            )
             st.success("Student details extracted successfully!")
-
-        except json.JSONDecodeError:
-            st.error("AI returned invalid JSON. Please try again.")
-
-        except Exception as e:
-            st.error(f"Image extraction failed: {e}")
+            if extracted["course"] and not matching_course:
+                st.warning(
+                    f"AI extracted course '{extracted['course']}', but it does not "
+                    "match a course in the Courses table. Please select the correct "
+                    "course manually; AI has not selected a different course."
+                )
+        except Exception as error:
+            st.error(f"Image extraction failed: {error}")
 
 
 # ============================================================
-# STUDENT REGISTRATION FORM - CREATE OPERATION
+# FEE RECEIPT EXTRACTION
+# ============================================================
+
+st.subheader("Step 2: Upload Fee Receipt (Optional)")
+uploaded_receipt = st.file_uploader(
+    "Upload Fee Receipt Image",
+    type=["png", "jpg", "jpeg"],
+    key="fee_receipt_image"
+)
+
+if uploaded_receipt is not None:
+    st.image(uploaded_receipt, caption="Uploaded Fee Receipt", width=350)
+
+if st.button("🧾 Extract Fee Receipt Details"):
+    if uploaded_receipt is None:
+        st.warning("Please upload a fee receipt first.")
+    else:
+        try:
+            with st.spinner("AI is reading fee receipt details..."):
+                receipt_part = types.Part.from_bytes(
+                    data=uploaded_receipt.getvalue(),
+                    mime_type=uploaded_receipt.type
+                )
+                receipt_prompt = """
+Read the uploaded fee receipt. Return valid JSON only:
+{
+  "receipt_number": "",
+  "student_name": "",
+  "student_reference": "",
+  "course": "",
+  "payment_date": "",
+  "payment_mode": "",
+  "tuition_fee": "",
+  "development_fee": "",
+  "library_fee": "",
+  "total_amount": ""
+}
+Rules:
+- Extract only information visible on the receipt.
+- Never invent missing information.
+- Amounts must be numeric values without currency symbols or commas.
+- Date should be YYYY-MM-DD if possible.
+- student_reference is only a printed reference; it is NOT the database student_id.
+- If a value is unclear or absent, return an empty string.
+"""
+                receipt_response = client.models.generate_content(
+                    model="gemini-3.6-flash",
+                    contents=[receipt_prompt, receipt_part],
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                        response_mime_type="application/json"
+                    )
+                )
+                receipt_data = extract_json_from_response(receipt_response)
+
+            st.session_state.fee_receipt_data = receipt_data
+            st.session_state.fee_receipt_number = str(
+                receipt_data.get("receipt_number") or ""
+            )
+            st.session_state.fee_payment_date = str(
+                receipt_data.get("payment_date") or ""
+            )
+            st.session_state.fee_payment_mode = str(
+                receipt_data.get("payment_mode") or ""
+            )
+            st.session_state.fee_total_amount = str(
+                receipt_data.get("total_amount") or ""
+            )
+            st.success("Fee receipt details extracted. Please review them below.")
+            st.json(receipt_data)
+        except Exception as error:
+            st.error(f"Fee receipt extraction failed: {error}")
+
+
+# ============================================================
+# REVIEW AND SAVE STUDENT + FEE IN ONE TRANSACTION
 # ============================================================
 
 if st.session_state.get("student_extraction_done", False):
-
     st.divider()
-    st.subheader("Step 2: Preview and Edit Student Details")
-
+    st.subheader("Step 3: Review and Save Student Details")
     st.info(
-        "AI has extracted the following information. "
-        "Please review and correct it before saving."
+        "Review the extracted information. If a fee receipt is attached, "
+        "the student and fee record will be saved together."
     )
 
     with st.form("student_registration_form"):
+        name = st.text_input("Student Name", key="student_name")
+        email = st.text_input("Email Address", key="student_email")
 
-        name = st.text_input(
-            "Student Name",
-            key="student_name"
+        course_options = ["-- Select a course --"] + course_names
+        saved_course = st.session_state.get(
+            "student_course", "-- Select a course --"
         )
+        if saved_course not in course_options:
+            saved_course = "-- Select a course --"
 
-        email = st.text_input(
-            "Email Address",
-            key="student_email"
-        )
-
-        course = st.text_input(
+        course = st.selectbox(
             "Course",
+            options=course_options,
+            index=course_options.index(saved_course),
             key="student_course"
         )
 
         status = st.selectbox(
             "Student Status",
-            options=["Select Status", "Active", "Inactive"],
+            ["Select Status", "Active", "Inactive"],
             key="student_status"
         )
-
         joining_date = st.text_input(
             "Joining Date (YYYY-MM-DD)",
             key="student_joining_date",
             placeholder="2026-07-15"
         )
+        city = st.text_input("City", key="student_city")
 
-        city = st.text_input(
-            "City",
-            key="student_city"
+        st.markdown("**Fee receipt information (optional)**")
+        receipt_number = st.text_input(
+            "Receipt Number", key="fee_receipt_number"
+        )
+        fee_amount = st.text_input(
+            "Total Fee Amount", key="fee_total_amount"
+        )
+        payment_date = st.text_input(
+            "Payment Date (YYYY-MM-DD)", key="fee_payment_date"
+        )
+        payment_mode = st.text_input(
+            "Payment Mode", key="fee_payment_mode"
         )
 
         save_student = st.form_submit_button(
-            "💾 Save Student to Database",
+            "💾 Save Student and Fee Receipt",
             type="primary"
         )
 
     if save_student:
-
         if not name.strip():
             st.error("Student name is required.")
-
-        elif not email.strip():
-            st.error("Email address is required.")
-
-        elif not re.match(
-            r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
-            email.strip()
-        ):
+        elif not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email.strip()):
             st.error("Please enter a valid email address.")
-
+        elif course == "-- Select a course --":
+            st.error("Please select a valid course from the Courses table.")
         elif status == "Select Status":
             st.error("Please select student status.")
-
         else:
-
             try:
-
                 if joining_date.strip():
                     date.fromisoformat(joining_date.strip())
 
-                database = get_database_connection()
-
-                try:
-
-                    database.execute(
-                        """
-                        INSERT INTO Students
-                        (
-                            name,
-                            email,
-                            course,
-                            status,
-                            joining_date,
-                            city
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            name.strip(),
-                            email.strip(),
-                            course.strip(),
-                            status,
-                            joining_date.strip() or None,
-                            city.strip()
-                        )
+                fee_amount_value = None
+                if fee_amount.strip():
+                    fee_amount_value = float(
+                        fee_amount.strip().replace(",", "").replace("₹", "")
                     )
+                    if fee_amount_value <= 0:
+                        raise ValueError("Fee amount must be greater than zero.")
 
-                    database.commit()
+                if fee_amount_value is not None and payment_date.strip():
+                    date.fromisoformat(payment_date.strip())
 
+                if fee_amount_value is not None and not receipt_number.strip():
+                    raise ValueError("Receipt number is required when saving a fee record.")
+
+                connection = get_database_connection()
+                try:
+                    with connection:
+                        cursor = connection.execute(
+                            """
+                            INSERT INTO Students
+                                (name, email, course_id, status, joining_date, city)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                name.strip(),
+                                email.strip(),
+                                course_id_by_name[course],
+                                status,
+                                joining_date.strip() or None,
+                                city.strip()
+                            )
+                        )
+                        new_student_id = cursor.lastrowid
+
+                        if fee_amount_value is not None:
+                            connection.execute(
+                                """
+                                INSERT INTO Fees
+                                    (student_id, receipt_number, amount,
+                                     payment_date, payment_mode)
+                                VALUES (?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    new_student_id,
+                                    receipt_number.strip(),
+                                    fee_amount_value,
+                                    payment_date.strip() or None,
+                                    payment_mode.strip() or None
+                                )
+                            )
                 finally:
-                    database.close()
+                    connection.close()
 
                 st.session_state.student_save_message = (
-                    f"Student {name.strip()} added successfully!"
+                    f"Student {name.strip()} saved successfully"
+                    + (" with fee receipt!" if fee_amount_value is not None else "!")
                 )
-
                 st.session_state.student_extraction_done = False
                 st.session_state.student_form_data = {}
-
+                st.session_state.fee_receipt_data = {}
+                for key in [
+                    "student_name", "student_email", "student_course",
+                    "student_status", "student_joining_date", "student_city",
+                    "fee_receipt_number", "fee_total_amount",
+                    "fee_payment_date", "fee_payment_mode"
+                ]:
+                    st.session_state.pop(key, None)
                 st.rerun()
 
-            except ValueError:
-                st.error(
-                    "Invalid joining date. Please use YYYY-MM-DD format."
-                )
-
+            except ValueError as error:
+                st.error(f"Please check the entered values: {error}")
             except sqlite3.IntegrityError:
-                st.error("This email already exists in the database.")
-
-            except sqlite3.Error as e:
-                st.error(f"Database error: {e}")
-
-            except Exception as e:
-                st.error(f"Something went wrong: {e}")
+                st.error("This email already exists or the selected relationship is invalid.")
+            except sqlite3.Error as error:
+                st.error(f"Database error: {error}")
+            except Exception as error:
+                st.error(f"Something went wrong: {error}")
 
 
 # ============================================================
@@ -1152,7 +1068,6 @@ if st.session_state.get("student_extraction_done", False):
 # ============================================================
 
 st.divider()
-
 st.caption(
     "AI Database Assistant | Powered by Gemini, Qdrant, SQLite and Streamlit"
 )

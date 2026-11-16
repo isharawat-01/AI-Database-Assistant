@@ -10,3 +10,14 @@ __pycache__/
 
 # Qdrant local database
 qdrant_storage/
+# SQLite databases
+students.db
+students_backup.db
+
+
+# Old backup code
+app_old.py
+
+# Test images
+*.png
+
