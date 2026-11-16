@@ -31,8 +31,134 @@ st.set_page_config(
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = BASE_DIR / "students.db"
+
+# Cloud deployment uses a separate demo database.
+# The original local students.db is never read, overwritten, or uploaded.
+DATABASE_PATH = BASE_DIR / "demo_students.db"
 SCHEMA_PATH = BASE_DIR / "schema.md"
+
+
+def initialize_demo_database():
+    """Create a small fictional database when the demo database is absent."""
+    connection = sqlite3.connect(str(DATABASE_PATH))
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS Courses (
+                course_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                course_name TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS Students (
+                student_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                course_id INTEGER NOT NULL,
+                status TEXT,
+                joining_date DATE,
+                city TEXT,
+                FOREIGN KEY (course_id) REFERENCES Courses(course_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS Fees (
+                fee_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                receipt_number TEXT,
+                amount REAL,
+                payment_date DATE,
+                payment_mode TEXT,
+                FOREIGN KEY (student_id) REFERENCES Students(student_id)
+                    ON DELETE CASCADE
+            );
+            """
+        )
+
+        course_count = connection.execute(
+            "SELECT COUNT(*) FROM Courses"
+        ).fetchone()[0]
+
+        if course_count == 0:
+            courses = ["MCA", "B.Tech", "BBA", "BCA", "MBA"]
+            connection.executemany(
+                "INSERT INTO Courses (course_name) VALUES (?)",
+                [(course,) for course in courses],
+            )
+
+        student_count = connection.execute(
+            "SELECT COUNT(*) FROM Students"
+        ).fetchone()[0]
+
+        if student_count == 0:
+            course_ids = {
+                name: course_id
+                for course_id, name in connection.execute(
+                    "SELECT course_id, course_name FROM Courses"
+                ).fetchall()
+            }
+
+            demo_students = [
+                ("Aarav Sharma", "aarav@example.com", "MCA", "Active", "2026-07-10", "Haldwani"),
+                ("Ananya Verma", "ananya@example.com", "B.Tech", "Active", "2026-07-12", "Dehradun"),
+                ("Kabir Joshi", "kabir@example.com", "BBA", "Active", "2026-07-15", "Nainital"),
+                ("Meera Singh", "meera@example.com", "MCA", "Inactive", "2026-07-18", "Rudrapur"),
+                ("Rohan Gupta", "rohan@example.com", "BCA", "Active", "2026-07-20", "Kichha"),
+                ("Diya Rawat", "diya@example.com", "MBA", "Active", "2026-07-22", "Haldwani"),
+                ("Ishaan Kumar", "ishaan@example.com", "B.Tech", "Inactive", "2026-07-25", "Bareilly"),
+                ("Sana Khan", "sana@example.com", "MCA", "Active", "2026-07-28", "Dehradun"),
+                ("Vivaan Mehta", "vivaan@example.com", "BBA", "Active", "2026-08-01", "Rishikesh"),
+                ("Aditi Bisht", "aditi@example.com", "BCA", "Active", "2026-08-03", "Nainital"),
+            ]
+
+            connection.executemany(
+                """
+                INSERT INTO Students
+                    (name, email, course_id, status, joining_date, city)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (name, email, course_ids[course], status, joining_date, city)
+                    for name, email, course, status, joining_date, city in demo_students
+                ],
+            )
+
+        fee_count = connection.execute(
+            "SELECT COUNT(*) FROM Fees"
+        ).fetchone()[0]
+
+        if fee_count == 0:
+            student_ids = {
+                email: student_id
+                for student_id, email in connection.execute(
+                    "SELECT student_id, email FROM Students"
+                ).fetchall()
+            }
+            demo_fees = [
+                ("aarav@example.com", "DEMO-1001", 25000, "2026-08-10", "Online"),
+                ("ananya@example.com", "DEMO-1002", 30000, "2026-08-12", "Card"),
+                ("kabir@example.com", "DEMO-1003", 18000, "2026-08-15", "Cash"),
+                ("diya@example.com", "DEMO-1004", 22000, "2026-08-18", "UPI"),
+                ("sana@example.com", "DEMO-1005", 25000, "2026-08-20", "Online"),
+            ]
+            connection.executemany(
+                """
+                INSERT INTO Fees
+                    (student_id, receipt_number, amount, payment_date, payment_mode)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (student_ids[email], receipt, amount, payment_date, mode)
+                    for email, receipt, amount, payment_date, mode in demo_fees
+                    if email in student_ids
+                ],
+            )
+
+        connection.commit()
+    finally:
+        connection.close()
+
+
+initialize_demo_database()
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -45,9 +171,7 @@ if not api_key:
     st.error("Gemini API key not found. Please configure GEMINI_API_KEY.")
     st.stop()
 
-if not DATABASE_PATH.exists():
-    st.error("students.db database file not found.")
-    st.stop()
+st.info("Demo mode: this app uses fictional sample records. Your original local students.db is not used.")
 
 if not SCHEMA_PATH.exists():
     st.error("schema.md file not found.")
