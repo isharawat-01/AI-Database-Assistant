@@ -6,10 +6,16 @@ import re
 import pandas as pd
 import plotly.express as px
 
+from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct
+)
 
 # ---------------- PAGE CONFIG ----------------
 
@@ -21,22 +27,104 @@ st.set_page_config(
 
 # ---------------- LOAD CONFIGURATION ----------------
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = BASE_DIR / "students.db"
+SCHEMA_PATH = BASE_DIR / "schema.md"
 
-api_key = os.getenv("GEMINI_API_KEY")
+load_dotenv(BASE_DIR / ".env")
+
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    st.error("Gemini API key not found. Please check your .env file.")
+    st.error(
+        "Gemini API key not found. "
+        "Please configure GEMINI_API_KEY in Streamlit Secrets."
+    )
     st.stop()
 
-client = genai.Client(
-    api_key=api_key,
-    http_options=types.HttpOptions(timeout=120000)
-)
+if not DATABASE_PATH.exists():
+    st.error("students.db database file not found.")
+    st.stop()
 
-# ---------------- QDRANT CONNECTION ----------------
+if not SCHEMA_PATH.exists():
+    st.error("schema.md file not found.")
+    st.stop()
 
-qdrant = QdrantClient(path="./qdrant_storage")
+
+# ---------------- INITIALIZE AI AND QDRANT ----------------
+
+@st.cache_resource
+def initialize_services(api_key):
+
+    # Initialize Gemini
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=120000)
+    )
+
+    # Initialize in-memory Qdrant
+    qdrant = QdrantClient(":memory:")
+
+    collection_name = "student_schema"
+
+    # Read database schema
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as file:
+        schema_text = file.read()
+
+    # Create Qdrant collection
+    qdrant.create_collection(
+        collection_name=collection_name,
+        vectors_config=VectorParams(
+            size=768,
+            distance=Distance.COSINE
+        )
+    )
+
+    # Generate schema embedding
+    embedding_response = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=schema_text,
+        config=types.EmbedContentConfig(
+            task_type="RETRIEVAL_DOCUMENT",
+            output_dimensionality=768
+        )
+    )
+
+    embedding = embedding_response.embeddings[0].values
+
+    # Store schema embedding in Qdrant
+    qdrant.upsert(
+        collection_name=collection_name,
+        points=[
+            PointStruct(
+                id=1,
+                vector=embedding,
+                payload={
+                    "text": schema_text,
+                    "source": "schema.md"
+                }
+            )
+        ]
+    )
+
+    return client, qdrant
+
+
+try:
+    client, qdrant = initialize_services(api_key)
+except Exception as e:
+    st.error(f"AI initialization failed: {e}")
+    st.stop()
+
+
+# ---------------- DATABASE CONNECTION ----------------
+
+def get_database_connection():
+    return sqlite3.connect(str(DATABASE_PATH))
+
 
 # ---------------- HEADER ----------------
 
@@ -49,9 +137,10 @@ st.write(
 
 st.divider()
 
+
 # ---------------- DASHBOARD STATISTICS ----------------
 
-conn = sqlite3.connect("students.db")
+conn = get_database_connection()
 cursor = conn.cursor()
 
 total = cursor.execute(
@@ -84,7 +173,7 @@ col4.metric("MCA Students", mca)
 
 st.subheader("📚 Course-wise Student Distribution")
 
-chart_conn = sqlite3.connect("students.db")
+chart_conn = get_database_connection()
 
 course_data = pd.read_sql_query(
     """
@@ -106,11 +195,12 @@ st.bar_chart(
     y_label="Number of Students"
 )
 
+
 # ---------------- CITY-WISE ANALYSIS ----------------
 
 st.subheader("🌍 City-wise Student Distribution")
 
-city_conn = sqlite3.connect("students.db")
+city_conn = get_database_connection()
 
 city_data = pd.read_sql_query(
     """
@@ -137,7 +227,7 @@ st.bar_chart(
 
 st.subheader("📊 Active vs Inactive Students")
 
-status_conn = sqlite3.connect("students.db")
+status_conn = get_database_connection()
 
 status_data = pd.read_sql_query(
     """
@@ -158,10 +248,13 @@ fig = px.pie(
     hole=0.4
 )
 
-st.plotly_chart(fig, use_container_width=True)
-
+st.plotly_chart(
+    fig,
+    width="stretch"
+)
 
 st.divider()
+
 
 # ---------------- QUESTION INPUT ----------------
 
@@ -172,18 +265,22 @@ question = st.text_input(
     placeholder="Example: How many students are enrolled in MCA?"
 )
 
+
 # ---------------- PROCESS QUESTION ----------------
 
 if st.button("Generate Answer", type="primary"):
 
     if not question.strip():
-        st.warning("Please enter a question first.")
+
+        st.warning("Please enter your question first.")
 
     else:
+
         try:
+
             with st.spinner("Understanding your question..."):
 
-                # STEP 1: Generate query embedding
+                # STEP 1: Generate question embedding
 
                 embedding_response = client.models.embed_content(
                     model="gemini-embedding-001",
@@ -196,7 +293,7 @@ if st.button("Generate Answer", type="primary"):
 
                 query_vector = embedding_response.embeddings[0].values
 
-                # STEP 2: Retrieve schema from Qdrant
+                # STEP 2: Retrieve relevant schema from Qdrant
 
                 search_result = qdrant.query_points(
                     collection_name="student_schema",
@@ -214,10 +311,9 @@ if st.button("Generate Answer", type="primary"):
                 # STEP 3: Generate SQL using Gemini
 
                 prompt = f"""
-You are an expert SQLite SQL generator.
+You are an expert SQLite SQL query generator.
 
-Use only the following database schema:
-
+Database Schema:
 {schema}
 
 User Question:
@@ -225,9 +321,10 @@ User Question:
 
 Instructions:
 1. Generate only one valid SQLite SELECT query.
-2. Do not generate INSERT, UPDATE, DELETE, DROP or other modification queries.
-3. Use only tables and columns present in the schema.
-4. Return only SQL without explanations or markdown.
+2. Use only existing tables and columns.
+3. Never generate INSERT, UPDATE, DELETE, DROP,
+   ALTER, CREATE or other modification queries.
+4. Return only SQL without explanation or markdown.
 
 SQL Query:
 """
@@ -240,7 +337,14 @@ SQL Query:
                     )
                 )
 
+                if not response.text:
+                    raise ValueError(
+                        "Gemini returned an empty SQL response."
+                    )
+
                 sql_query = response.text.strip()
+
+                # Remove markdown formatting if present
 
                 sql_query = re.sub(
                     r"^```(?:sql)?\s*|\s*```$",
@@ -259,11 +363,15 @@ SQL Query:
 
             st.subheader("📊 Query Result")
 
-            if not sql_query.upper().startswith("SELECT"):
+            if not re.match(
+                r"^SELECT\b",
+                sql_query,
+                re.IGNORECASE
+            ):
                 st.error("Only SELECT queries are allowed.")
                 st.stop()
 
-            database = sqlite3.connect("students.db")
+            database = get_database_connection()
 
             allowed_actions = {
                 sqlite3.SQLITE_SELECT,
@@ -277,32 +385,47 @@ SQL Query:
             ):
                 if action in allowed_actions:
                     return sqlite3.SQLITE_OK
+
                 return sqlite3.SQLITE_DENY
 
-            database.set_authorizer(read_only_authorizer)
+            try:
 
-            result = database.execute(sql_query).fetchall()
+                database.set_authorizer(read_only_authorizer)
 
-            columns = [
-                description[0]
-                for description in database.execute(
-                    sql_query
-                ).description
-            ]
+                result_cursor = database.execute(sql_query)
 
-            database.close()
+                result = result_cursor.fetchall()
+
+                columns = [
+                    description[0]
+                    for description in result_cursor.description
+                ]
+
+            finally:
+                database.close()
 
             if result:
+
                 st.success("Query executed successfully!")
-                st.dataframe(
-                    [dict(zip(columns, row)) for row in result],
-                    use_container_width=True
+
+                result_df = pd.DataFrame(
+                    result,
+                    columns=columns
                 )
+
+                st.dataframe(
+                    result_df,
+                    width="stretch"
+                )
+
             else:
+
                 st.info("No records found.")
 
         except Exception as e:
+
             st.error(f"Something went wrong: {e}")
+
 
 # ---------------- FOOTER ----------------
 
