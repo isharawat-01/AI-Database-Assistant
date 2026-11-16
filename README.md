@@ -1,148 +1,81 @@
-# 🤖 AI-Powered Database Assistant
+# AI Database Assistant – Project Demonstration
 
-An AI-powered Natural Language to SQL Query Generator that allows users to interact with a student database using simple English questions.
+**Opening**
 
-## 🚀 Live Demo
+Good morning Sir.
 
-[Open AI Database Assistant](https://isharawat-01-ai-database-assistant-app-i5wnvv.streamlit.app/)
+Today, I am going to demonstrate my project, AI Database Assistant.
 
-## 📌 Project Overview
+This project is designed to simplify student database management using Artificial Intelligence. It allows users to extract information from student forms and fee receipts, manage relational student records, and ask database questions in natural language.
 
-This project converts natural language questions into SQL queries using Google's Gemini AI. It uses Retrieval-Augmented Generation (RAG) with Qdrant to retrieve database schema information and SQLite to execute the generated SQL queries.
+**1. Dashboard**
 
-The application also provides an interactive dashboard for analyzing student records.
+First, this is the main dashboard.
 
-## ✨ Features
+It displays important student statistics such as total students, active students, inactive students, course-wise information, and fee collection.
 
-- Natural Language to SQL Query Generation
-- Gemini AI Integration
-- RAG-based Schema Retrieval
-- Qdrant Vector Database
-- SQLite Database Integration
-- Interactive Streamlit Dashboard
-- Course-wise Student Analysis
-- City-wise Student Analysis
-- Active vs Inactive Student Visualization
-- Read-only SQL Query Execution
+**2. Student Form Image Extraction**
 
-## 🛠️ Technologies Used
+Now, I will demonstrate AI-based student registration.
 
-| Technology | Purpose |
-|---|---|
-| Python | Core programming language |
-| Streamlit | Web application and dashboard |
-| Google Gemini AI | SQL query generation |
-| Qdrant | Vector database |
-| RAG | Schema retrieval |
-| SQLite | Database management |
-| Pandas | Data processing |
-| Plotly | Data visualization |
+Instead of manually entering every detail, I can upload a student registration form image.
 
-## 🏗️ Project Workflow
+Gemini AI extracts the student's name, email, course, status, joining date, and city.
 
-1. User enters a question in natural language.
-2. Gemini generates an embedding for the question.
-3. Qdrant retrieves the relevant database schema.
-4. Gemini generates an SQL query using the retrieved schema.
-5. SQLite executes the read-only SQL query.
-6. Results are displayed on the Streamlit dashboard.
+The extracted information is automatically filled into the registration form, where the user can review it before saving.
 
-## 📂 Project Structure
+**3. Fee Receipt Extraction**
 
-```text
-AI-Database-Assistant/
-│
-├── app.py
-├── main.py
-├── create_database.py
-├── embed_schema.py
-├── retrieve_schema.py
-├── generate_sql.py
-├── execute_sql.py
-├── schema.md
-├── students.db
-├── requirements.txt
-└── .gitignore
-```
+Next, I will upload a fee receipt image.
 
-## ⚙️ Installation and Setup
+The AI extracts the receipt number, student name, payment date, payment mode, and total amount.
 
-### 1. Clone the repository
+The user can review the extracted details before saving.
 
-```bash
-git clone https://github.com/isharawat-01/AI-Database-Assistant.git
-```
+**4. Student and Fee Database Relationship**
 
-### 2. Navigate to the project folder
+When I save the student and fee receipt together, the application inserts the student record first and obtains its actual database ID.
 
-```bash
-cd AI-Database-Assistant
-```
+The fee record is then linked to that student using the Foreign Key relationship.
 
-### 3. Create a virtual environment
+This maintains data consistency.
 
-```bash
-python -m venv venv
-```
+**5. Fee Records**
 
-### 4. Activate the virtual environment
+Here, I can view fee records associated with students.
 
-Windows:
+**6. Ask Your Database**
 
-```bash
-venv\Scripts\activate
-```
+One of the main features is natural language database querying.
 
-### 5. Install dependencies
+Instead of writing SQL manually, I can ask questions in English or Hinglish.
 
-```bash
-pip install -r requirements.txt
-```
+For example:
 
-### 6. Configure Gemini API Key
+- How many students are in MCA?
+- Isha Rawat ki fees kitni hai?
+- Show student names with their course names.
 
-Create a `.env` file in the project directory:
+The AI generates a SQL query, executes it in read-only mode, and displays the result.
 
-```env
-GEMINI_API_KEY=your_gemini_api_key
-```
+**7. Voice-Based Database Query**
 
-Never upload your API key to GitHub.
+The application also provides voice-based querying.
 
-### 7. Run the application
+Users can record their questions instead of typing them.
 
-```bash
-streamlit run app.py
-```
+The speech is processed, converted into a database question, and used to generate SQL.
 
-## 📊 Dashboard
+**8. Database Relationships**
 
-The dashboard displays:
+The project contains three relational tables: Courses, Students, and Fees.
 
-- Total number of students
-- Active students
-- Inactive students
-- MCA students
-- Course-wise distribution
-- City-wise distribution
-- Student status distribution
+Students are connected to Courses through course_id, while Fees are connected to Students through student_id.
 
-## 🔮 Future Scope
+I have also tested SQL JOIN and LEFT JOIN queries to verify these relationships.
 
-- Support for multiple database systems
-- More advanced schema retrieval
-- Improved query validation
-- Query history and analytics
-- Enhanced dashboard visualizations
+**Closing**
 
-## 👩‍💻 Author
+This project combines AI-based information extraction, relational database management, and natural language interaction in a single application.
 
-**Isha Rawat**
-
-MCA Student | Python | SQL | Data Analysis | AI
-
-GitHub: [isharawat-01](https://github.com/isharawat-01)
-
----
-
-⭐ If you find this project useful, consider giving the repository a star!
+Thank you.
