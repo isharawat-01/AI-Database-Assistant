@@ -1,0 +1,12 @@
+# Secret API keys
+.env
+
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Qdrant local database
+qdrant_storage/
